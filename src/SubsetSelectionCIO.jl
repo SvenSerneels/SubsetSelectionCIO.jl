@@ -10,23 +10,25 @@ import ScikitLearn
 
 include("inner_op.jl")
 
-export oa_formulation, L0Enet, fit!, predict
+export oa_formulation, L0Enet, sparse_regression
 
 getthreads() = haskey(ENV, "SLURM_JOB_CPUS_PER_NODE") ? parse(Int, ENV["SLURM_JOB_CPUS_PER_NODE"]) : 0
 
 @with_kw mutable struct L0Enet <: BaseRegressor
-    sparsity
-    lambda_reg
+    sparsity=5
+    lambda_reg=1/sqrt(5)
     loss=SubsetSelection.OLS()
-    lnr_params=Dict(:decrease_final_regularizer => true,
-                    :relaxation => false,
+    lnr_params=Dict(:ΔT_max => 60,
+                    :verbose => false,
+                    :Gap => 0e-3,
                     :solver => :Gurobi,
-                    :ΔT_max => 120.,
-                    :Gap => 1e-4,
-                    :nodefilestart => Inf) # dictionary: params used for train
+                    :rootnode => true,
+                    :rootCuts => 20,
+                    :stochastic => false) # dictionary: params used for train
     coef_=nothing
     z_=nothing
     t_=0.
+    indices_ = nothing
     lnr_stats_=Dict() # dictionary: optimization stats
 end
 
@@ -37,25 +39,22 @@ function fit!(obj::L0Enet, X, y)
     n,p = size(X)
     @assert size(y)[1]==n "Number of cases in X and Y need to agree"
     t_total = @elapsed Sparse_Regressor = oa_formulation(obj.loss,
-                X, y, obj.sparsity, 1/obj.lambda_reg, obj.lnr_params...
+                y, X, obj.sparsity, 1/obj.lambda_reg; obj.lnr_params...
               )
-    indices, w, solverTime, status, Gap, cutCount, cutTime = Sparse_Regressor
+    indices0, w0, Δt, status, Gap, cutCount = Sparse_Regressor
     z = zeros(p,1)
     beta = zeros(p,1)
-    for i in indices
-        i_index = [j for (j,ind) in enumerate(indices) if i==ind][1]
-        z[:,i] .= 1
-        beta[:,i] .= w[i_index]
+    for (i,j) in enumerate(indices0)
+        z[j,:] .= 1
+        beta[j,:] .= w0[i]
     end
-    setfield(obj,"coef_",beta)
-    setfield(obj,"z_",z)
-    setfield(obj,"t_",t_total)
-    obj.lnr_stats[:status] = status
-    obj.lnr_stats[:Gap] = Gap
-    obj.lnr_stats[:t_solver] = solverTime
-    obj.lnr_stats[:cut_count] = cutCount
-    obj.lnr_stats[:t_cut_total] = cutTime
-    obj.lnr_stats[:t_cut_avg] = cutTime/cutCount
+    setfield!(obj,:coef_,beta)
+    setfield!(obj,:z_,z)
+    setfield!(obj,:t_,Δt)
+    setfield!(obj,:indices_,indices0)
+    obj.lnr_stats_[:status] = status
+    obj.lnr_stats_[:Gap] = Gap
+    obj.lnr_stats_[:cut_count] = cutCount
 
     return obj
 
@@ -66,7 +65,7 @@ function predict(obj::L0Enet,Xn)
     ń,ṕ = size(Xn)
     @assert ṕ == length(obj.z_) "New data must have same number of variables"
 
-    return Xn[:,obj.z_]*obj.coef_
+    return reshape(Xn*obj.coef_,(ń,))
 
 end
 
@@ -74,21 +73,24 @@ function sparse_regression(X,
                            Y;
                            sparsity::Int=min(5,size(X,2)),
                            lambda_reg::Real=1/sqrt(size(X,1)),
-                           decrease_final_regularizer::Bool=true,
-                           relaxation::Bool=false,
+                           ΔT_max::Int=60,
+                           verbose::Bool=false,
+                           Gap::Float32=0e-3,
                            solver::Symbol=:Gurobi,
-                           time_limit::Real=120.,
-                           mip_gap::Real=1e-4,
-                           nodefilestart::Real=Inf,
-                           verbose::Int=0)
+                           rootnode::Bool=true,
+                           rootCuts::Int=20,
+                           stochastic::Bool=false)
 
     lnr = L0Enet()
     lnr[:sparsity] = sparsity
     lnr[:lambda_reg] = lambda_reg
-    lnr.lnr_params[:relaxation] = relaxation
+    lnr.lnr_params[:ΔT_max] = ΔT_max
     lnr.lnr_params[:solver] = solver
-    lnr.lnr_params[:ΔT_max] = time_limit
-    lnr.lnr_params[:Gap] = mip_gap
+    lnr.lnr_params[:verbose] = verbose
+    lnr.lnr_params[:Gap] = Gap
+    lnr.lnr_params[:rootnode] = rootnode
+    lnr.lnr_params[:rootCuts] = rootCuts
+    lnr.lnr_params[:stochastic] = stochastic
 
     fit!(lnr,X,y)
 
